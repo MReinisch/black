@@ -59,6 +59,9 @@ from blib2to3.pgen2 import driver, token
 from blib2to3.pgen2.grammar import Grammar
 from blib2to3.pgen2.parse import ParseError
 
+from black.reporting import Report, JunitReport
+from black.enum import Changed
+
 from _black_version import version as __version__
 
 if TYPE_CHECKING:
@@ -70,7 +73,7 @@ DEFAULT_INCLUDES = r"\.pyi?$"
 CACHE_DIR = Path(user_cache_dir("black", version=__version__))
 
 STRING_PREFIX_CHARS: Final = "furbFURB"  # All possible string prefix characters.
-
+DEFAULT_REPORT = "console"
 
 # types
 FileContent = str
@@ -164,11 +167,9 @@ class WriteBack(Enum):
         return cls.DIFF if diff else cls.YES
 
 
-class Changed(Enum):
-    NO = 0
-    CACHED = 1
-    YES = 2
-
+class ReportType(Enum):
+    CONSOLE = 'report'
+    JUNIT = 'junit'
 
 class TargetVersion(Enum):
     PY27 = 2
@@ -346,6 +347,16 @@ def target_version_option_callback(
     """
     return [TargetVersion[val.upper()] for val in v]
 
+def report_option_callback(
+    c: click.Context, p: Union[click.Option, click.Parameter], v: str
+) -> List[ReportType]:
+    """Compute the report type from a --report flag.
+
+    This is its own function because mypy couldn't infer the type correctly
+    when it was a lambda, causing mypyc trouble.
+    """
+    return ReportType[v.upper()]
+
 
 @click.command(context_settings=dict(help_option_names=["-h", "--help"]))
 @click.option("-c", "--code", type=str, help="Format the code passed in as a string.")
@@ -461,7 +472,7 @@ def target_version_option_callback(
     "--verbose",
     is_flag=True,
     help=(
-        "Also emit messages to stderr about files that were not changed or were ignored"
+        "Also emit messages to stderr about files that were not changed.py or were ignored"
         " due to --exclude=."
     ),
 )
@@ -488,6 +499,16 @@ def target_version_option_callback(
     callback=read_pyproject_toml,
     help="Read configuration from FILE path.",
 )
+@click.option(
+    "--report",
+    type=click.Choice([v.name.lower() for v in ReportType]),
+    callback=report_option_callback,
+    default=DEFAULT_REPORT,
+    multiple=False,
+    help=(
+        "Option if the generated Report should be to the Console or a Junit XML File [default : Console]"
+    ),
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -508,6 +529,7 @@ def main(
     force_exclude: Optional[str],
     src: Tuple[str, ...],
     config: Optional[str],
+    report: str,
 ) -> None:
     """The uncompromising code formatter."""
     write_back = WriteBack.from_configuration(check=check, diff=diff, color=color)
@@ -528,7 +550,10 @@ def main(
     if code is not None:
         print(format_str(code, mode=mode))
         ctx.exit(0)
-    report = Report(check=check, diff=diff, quiet=quiet, verbose=verbose)
+    if report is ReportType.JUNIT:
+        report = JunitReport(check=check, diff=diff, quiet=quiet, verbose=verbose)
+    else:
+        report = Report(check=check, diff=diff, quiet=quiet, verbose=verbose)
     sources = get_sources(
         ctx=ctx,
         src=src,
@@ -800,7 +825,7 @@ def format_file_in_place(
     write_back: WriteBack = WriteBack.NO,
     lock: Any = None,  # multiprocessing.Manager().Lock() is some crazy proxy
 ) -> bool:
-    """Format file under `src` path. Return True if changed.
+    """Format file under `src` path. Return True if changed.py.
 
     If `write_back` is DIFF, write a diff to stdout. If it is YES, write reformatted
     code to the file.
@@ -890,7 +915,7 @@ def wrap_stream_for_windows(
 def format_stdin_to_stdout(
     fast: bool, *, write_back: WriteBack = WriteBack.NO, mode: Mode
 ) -> bool:
-    """Format file on stdin. Return True if changed.
+    """Format file on stdin. Return True if changed.py.
 
     If `write_back` is YES, write reformatted code back to stdout. If it is DIFF,
     write a diff to stdout. The `mode` argument is passed to
@@ -4017,7 +4042,7 @@ class StringParenWrapper(CustomSplitMapMixin, BaseStringSplitter):
 
     Collaborations:
         In the event that a string line split by StringParenWrapper is
-        changed such that it no longer needs to be given its own line,
+        changed.py such that it no longer needs to be given its own line,
         StringParenWrapper relies on StringParenStripper to clean up the
         parentheses it created.
     """
@@ -5982,92 +6007,6 @@ def find_project_root(srcs: Iterable[str]) -> Path:
             return directory
 
     return directory
-
-
-@dataclass
-class Report:
-    """Provides a reformatting counter. Can be rendered with `str(report)`."""
-
-    check: bool = False
-    diff: bool = False
-    quiet: bool = False
-    verbose: bool = False
-    change_count: int = 0
-    same_count: int = 0
-    failure_count: int = 0
-
-    def done(self, src: Path, changed: Changed) -> None:
-        """Increment the counter for successful reformatting. Write out a message."""
-        if changed is Changed.YES:
-            reformatted = "would reformat" if self.check or self.diff else "reformatted"
-            if self.verbose or not self.quiet:
-                out(f"{reformatted} {src}")
-            self.change_count += 1
-        else:
-            if self.verbose:
-                if changed is Changed.NO:
-                    msg = f"{src} already well formatted, good job."
-                else:
-                    msg = f"{src} wasn't modified on disk since last run."
-                out(msg, bold=False)
-            self.same_count += 1
-
-    def failed(self, src: Path, message: str) -> None:
-        """Increment the counter for failed reformatting. Write out a message."""
-        err(f"error: cannot format {src}: {message}")
-        self.failure_count += 1
-
-    def path_ignored(self, path: Path, message: str) -> None:
-        if self.verbose:
-            out(f"{path} ignored: {message}", bold=False)
-
-    @property
-    def return_code(self) -> int:
-        """Return the exit code that the app should use.
-
-        This considers the current state of changed files and failures:
-        - if there were any failures, return 123;
-        - if any files were changed and --check is being used, return 1;
-        - otherwise return 0.
-        """
-        # According to http://tldp.org/LDP/abs/html/exitcodes.html starting with
-        # 126 we have special return codes reserved by the shell.
-        if self.failure_count:
-            return 123
-
-        elif self.change_count and self.check:
-            return 1
-
-        return 0
-
-    def __str__(self) -> str:
-        """Render a color report of the current state.
-
-        Use `click.unstyle` to remove colors.
-        """
-        if self.check or self.diff:
-            reformatted = "would be reformatted"
-            unchanged = "would be left unchanged"
-            failed = "would fail to reformat"
-        else:
-            reformatted = "reformatted"
-            unchanged = "left unchanged"
-            failed = "failed to reformat"
-        report = []
-        if self.change_count:
-            s = "s" if self.change_count > 1 else ""
-            report.append(
-                click.style(f"{self.change_count} file{s} {reformatted}", bold=True)
-            )
-        if self.same_count:
-            s = "s" if self.same_count > 1 else ""
-            report.append(f"{self.same_count} file{s} {unchanged}")
-        if self.failure_count:
-            s = "s" if self.failure_count > 1 else ""
-            report.append(
-                click.style(f"{self.failure_count} file{s} {failed}", fg="red")
-            )
-        return ", ".join(report) + "."
 
 
 def parse_ast(src: str) -> Union[ast.AST, ast3.AST, ast27.AST]:
